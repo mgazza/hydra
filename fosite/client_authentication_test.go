@@ -5,6 +5,7 @@ package fosite_test
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"encoding/base64"
@@ -594,4 +595,104 @@ func TestAuthenticateClientTwice(t *testing.T) {
 	require.Error(t, err)
 	assert.EqualError(t, err, ErrJTIKnown.Error())
 	assert.Nil(t, c)
+}
+
+func TestClientJWKThumbprint(t *testing.T) {
+	const assertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+	key := gen.MustRSAKey()
+	jwk := jose.JSONWebKey{
+		KeyID: "kid-foo",
+		Use:   "sig",
+		Key:   &key.PublicKey,
+	}
+	thumbprint, err := jwk.Thumbprint(crypto.SHA256)
+	require.NoError(t, err)
+	expectedThumbprint := base64.RawURLEncoding.EncodeToString(thumbprint)
+
+	hasher := &BCrypt{Config: &Config{HashCost: 6}}
+	secret, err := hasher.Hash(t.Context(), []byte("secret"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name               string
+		client             *DefaultOpenIDConnectClient
+		configureRequest   func(*http.Request, url.Values)
+		expectedThumbprint string
+	}{
+		{
+			name: "private_key_jwt",
+			client: &DefaultOpenIDConnectClient{
+				DefaultClient:           &DefaultClient{ID: "private-key-client"},
+				JSONWebKeys:             &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}},
+				TokenEndpointAuthMethod: "private_key_jwt",
+			},
+			configureRequest: func(_ *http.Request, form url.Values) {
+				form.Set("client_id", "private-key-client")
+				form.Set("client_assertion_type", assertionType)
+				form.Set("client_assertion", mustGenerateRSAAssertion(t, jwt.MapClaims{
+					"sub": "private-key-client",
+					"exp": time.Now().Add(time.Hour).Unix(),
+					"iss": "private-key-client",
+					"jti": "thumbprint-test",
+					"aud": "token-url",
+				}, key, "kid-foo"))
+			},
+			expectedThumbprint: expectedThumbprint,
+		},
+		{
+			name: "client_secret_basic",
+			client: &DefaultOpenIDConnectClient{
+				DefaultClient:           &DefaultClient{ID: "basic-client", Secret: secret},
+				TokenEndpointAuthMethod: "client_secret_basic",
+			},
+			configureRequest: func(r *http.Request, _ url.Values) {
+				r.Header = clientBasicAuthHeader("basic-client", "secret")
+			},
+		},
+		{
+			name: "client_secret_post",
+			client: &DefaultOpenIDConnectClient{
+				DefaultClient:           &DefaultClient{ID: "post-client", Secret: secret},
+				TokenEndpointAuthMethod: "client_secret_post",
+			},
+			configureRequest: func(_ *http.Request, form url.Values) {
+				form.Set("client_id", "post-client")
+				form.Set("client_secret", "secret")
+			},
+		},
+		{
+			name: "none",
+			client: &DefaultOpenIDConnectClient{
+				DefaultClient:           &DefaultClient{ID: "public-client", Public: true},
+				TokenEndpointAuthMethod: "none",
+			},
+			configureRequest: func(_ *http.Request, form url.Values) {
+				form.Set("client_id", "public-client")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := storage.NewMemoryStore()
+			store.Clients[tc.client.ID] = tc.client
+			f := &Fosite{
+				Store: store,
+				Config: &Config{
+					JWKSFetcherStrategy: NewDefaultJWKSFetcherStrategy(),
+					ClientSecretsHasher: hasher,
+					TokenURL:            "token-url",
+				},
+			}
+			form := url.Values{}
+			r := &http.Request{Method: http.MethodPost, Header: http.Header{}, Form: form, PostForm: form}
+			tc.configureRequest(r, form)
+
+			ctx := WithClientJWKThumbprint(t.Context())
+			_, err := f.AuthenticateClient(ctx, r, form)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedThumbprint, ClientJWKThumbprint(ctx))
+		})
+	}
 }

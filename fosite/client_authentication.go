@@ -5,8 +5,10 @@ package fosite
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -32,7 +34,37 @@ type ClientAuthenticationStrategy func(context.Context, *http.Request, url.Value
 // #nosec:gosec G101 - False Positive
 const clientAssertionJWTBearerType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 
+type clientJWKThumbprintContextKey struct{}
+
+type clientJWKThumbprintContextValue struct {
+	thumbprint string
+}
+
+// WithClientJWKThumbprint returns a context that can carry the JWK thumbprint of an authenticated client.
+func WithClientJWKThumbprint(ctx context.Context) context.Context {
+	return context.WithValue(ctx, clientJWKThumbprintContextKey{}, new(clientJWKThumbprintContextValue))
+}
+
+// ClientJWKThumbprint returns the authenticated client's JWK thumbprint from the context.
+func ClientJWKThumbprint(ctx context.Context) string {
+	if value, ok := ctx.Value(clientJWKThumbprintContextKey{}).(*clientJWKThumbprintContextValue); ok {
+		return value.thumbprint
+	}
+	return ""
+}
+
+func setClientJWKThumbprint(ctx context.Context, thumbprint string) {
+	if value, ok := ctx.Value(clientJWKThumbprintContextKey{}).(*clientJWKThumbprintContextValue); ok {
+		value.thumbprint = thumbprint
+	}
+}
+
 func (f *Fosite) findClientPublicJWK(ctx context.Context, oidcClient OpenIDConnectClient, t *jwt.Token, expectsRSAKey bool) (jwk interface{}, err error) {
+	jwk, _, err = f.findClientPublicJWKWithThumbprint(ctx, oidcClient, t, expectsRSAKey)
+	return jwk, err
+}
+
+func (f *Fosite) findClientPublicJWKWithThumbprint(ctx context.Context, oidcClient OpenIDConnectClient, t *jwt.Token, expectsRSAKey bool) (jwk interface{}, thumbprint string, err error) {
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/hydra/v2/fosite").Start(ctx, "Fosite.findClientPublicJWK",
 		trace.WithAttributes(
 			attribute.String("jwks_uri", oidcClient.GetJSONWebKeysURI()),
@@ -41,33 +73,34 @@ func (f *Fosite) findClientPublicJWK(ctx context.Context, oidcClient OpenIDConne
 	defer otelx.End(span, &err)
 
 	if set := oidcClient.GetJSONWebKeys(); set != nil {
-		return findPublicKey(t, set, expectsRSAKey)
+		return findPublicKeyWithThumbprint(t, set, expectsRSAKey)
 	}
 
 	if location := oidcClient.GetJSONWebKeysURI(); len(location) > 0 {
 		keys, err := f.Config.GetJWKSFetcherStrategy(ctx).Resolve(ctx, location, false)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
-		if key, err := findPublicKey(t, keys, expectsRSAKey); err == nil {
-			return key, nil
+		if key, thumbprint, err := findPublicKeyWithThumbprint(t, keys, expectsRSAKey); err == nil {
+			return key, thumbprint, nil
 		}
 
 		keys, err = f.Config.GetJWKSFetcherStrategy(ctx).Resolve(ctx, location, true)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
-		return findPublicKey(t, keys, expectsRSAKey)
+		return findPublicKeyWithThumbprint(t, keys, expectsRSAKey)
 	}
 
-	return nil, errorsx.WithStack(ErrInvalidClient.WithHint("The OAuth 2.0 Client has no JSON Web Keys set registered, but they are needed to complete the request."))
+	return nil, "", errorsx.WithStack(ErrInvalidClient.WithHint("The OAuth 2.0 Client has no JSON Web Keys set registered, but they are needed to complete the request."))
 }
 
 // AuthenticateClient authenticates client requests using the configured strategy
 // `Fosite.ClientAuthenticationStrategy`, if nil it uses `Fosite.DefaultClientAuthenticationStrategy`
 func (f *Fosite) AuthenticateClient(ctx context.Context, r *http.Request, form url.Values) (Client, error) {
+	setClientJWKThumbprint(ctx, "")
 	if s := f.Config.GetClientAuthenticationStrategy(ctx); s != nil {
 		return s(ctx, r, form)
 	}
@@ -77,6 +110,7 @@ func (f *Fosite) AuthenticateClient(ctx context.Context, r *http.Request, form u
 // DefaultClientAuthenticationStrategy provides the fosite's default client authentication strategy,
 // HTTP Basic Authentication and JWT Bearer
 func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *http.Request, form url.Values) (_ Client, err error) {
+	setClientJWKThumbprint(ctx, "")
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/hydra/v2/fosite").Start(ctx, "Fosite.DefaultClientAuthenticationStrategy")
 	defer otelx.End(span, &err)
 
@@ -90,6 +124,7 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 
 		var clientID string
 		var client Client
+		var thumbprint string
 
 		token, err := jwt.ParseWithClaims(assertion, jwt.MapClaims{}, func(t *jwt.Token) (interface{}, error) {
 			var err error
@@ -146,11 +181,17 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 
 			switch t.Method {
 			case jose.RS256, jose.RS384, jose.RS512:
-				return f.findClientPublicJWK(ctx, oidcClient, t, true)
+				key, value, err := f.findClientPublicJWKWithThumbprint(ctx, oidcClient, t, true)
+				thumbprint = value
+				return key, err
 			case jose.ES256, jose.ES384, jose.ES512:
-				return f.findClientPublicJWK(ctx, oidcClient, t, false)
+				key, value, err := f.findClientPublicJWKWithThumbprint(ctx, oidcClient, t, false)
+				thumbprint = value
+				return key, err
 			case jose.PS256, jose.PS384, jose.PS512:
-				return f.findClientPublicJWK(ctx, oidcClient, t, true)
+				key, value, err := f.findClientPublicJWKWithThumbprint(ctx, oidcClient, t, true)
+				thumbprint = value
+				return key, err
 			case jose.HS256, jose.HS384, jose.HS512:
 				return nil, errorsx.WithStack(ErrInvalidClient.WithHint("This authorization server does not support client authentication method 'client_secret_jwt'."))
 			default:
@@ -212,6 +253,7 @@ func (f *Fosite) DefaultClientAuthenticationStrategy(ctx context.Context, r *htt
 				strings.Join(f.Config.GetTokenURLs(ctx), "' or '")))
 		}
 
+		setClientJWKThumbprint(ctx, thumbprint)
 		return client, nil
 	} else if len(assertionType) > 0 {
 		return nil, errorsx.WithStack(ErrInvalidRequest.WithHintf("Unknown client_assertion_type '%s'.", assertionType))
@@ -296,10 +338,10 @@ func (f *Fosite) checkClientSecret(ctx context.Context, client Client, clientSec
 	return err
 }
 
-func findPublicKey(t *jwt.Token, set *jose.JSONWebKeySet, expectsRSAKey bool) (interface{}, error) {
+func findPublicKeyWithThumbprint(t *jwt.Token, set *jose.JSONWebKeySet, expectsRSAKey bool) (interface{}, string, error) {
 	keys := set.Keys
 	if len(keys) == 0 {
-		return nil, errorsx.WithStack(ErrInvalidRequest.WithHintf("The retrieved JSON Web Key Set does not contain any key."))
+		return nil, "", errorsx.WithStack(ErrInvalidRequest.WithHintf("The retrieved JSON Web Key Set does not contain any key."))
 	}
 
 	kid, ok := t.Header["kid"].(string)
@@ -308,7 +350,7 @@ func findPublicKey(t *jwt.Token, set *jose.JSONWebKeySet, expectsRSAKey bool) (i
 	}
 
 	if len(keys) == 0 {
-		return nil, errorsx.WithStack(ErrInvalidRequest.WithHintf("The JSON Web Token uses signing key with kid '%s', which could not be found.", kid))
+		return nil, "", errorsx.WithStack(ErrInvalidRequest.WithHintf("The JSON Web Token uses signing key with kid '%s', which could not be found.", kid))
 	}
 
 	for _, key := range keys {
@@ -317,19 +359,27 @@ func findPublicKey(t *jwt.Token, set *jose.JSONWebKeySet, expectsRSAKey bool) (i
 		}
 		if expectsRSAKey {
 			if k, ok := key.Key.(*rsa.PublicKey); ok {
-				return k, nil
+				thumbprint, err := key.Thumbprint(crypto.SHA256)
+				if err != nil {
+					return nil, "", errorsx.WithStack(err)
+				}
+				return k, base64.RawURLEncoding.EncodeToString(thumbprint), nil
 			}
 		} else {
 			if k, ok := key.Key.(*ecdsa.PublicKey); ok {
-				return k, nil
+				thumbprint, err := key.Thumbprint(crypto.SHA256)
+				if err != nil {
+					return nil, "", errorsx.WithStack(err)
+				}
+				return k, base64.RawURLEncoding.EncodeToString(thumbprint), nil
 			}
 		}
 	}
 
 	if expectsRSAKey {
-		return nil, errorsx.WithStack(ErrInvalidRequest.WithHintf("Unable to find RSA public key with use='sig' for kid '%s' in JSON Web Key Set.", kid))
+		return nil, "", errorsx.WithStack(ErrInvalidRequest.WithHintf("Unable to find RSA public key with use='sig' for kid '%s' in JSON Web Key Set.", kid))
 	} else {
-		return nil, errorsx.WithStack(ErrInvalidRequest.WithHintf("Unable to find ECDSA public key with use='sig' for kid '%s' in JSON Web Key Set.", kid))
+		return nil, "", errorsx.WithStack(ErrInvalidRequest.WithHintf("Unable to find ECDSA public key with use='sig' for kid '%s' in JSON Web Key Set.", kid))
 	}
 }
 

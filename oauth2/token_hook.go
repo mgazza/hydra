@@ -34,6 +34,8 @@ type AccessRequestHook func(ctx context.Context, requester fosite.AccessRequeste
 type Request struct {
 	// ClientID is the identifier of the OAuth 2.0 client.
 	ClientID string `json:"client_id"`
+	// ClientJWKThumbprint is the JWK thumbprint of the key used to authenticate the OAuth 2.0 client.
+	ClientJWKThumbprint string `json:"client_jwk_thumbprint,omitempty"`
 	// RequestedScopes is the list of scopes requested to the OAuth 2.0 client.
 	RequestedScopes []string `json:"requested_scopes"`
 	// GrantedScopes is the list of scopes granted to the OAuth 2.0 client.
@@ -182,12 +184,13 @@ func TokenHook(reg interface {
 		}
 
 		request := Request{
-			ClientID:        requester.GetClient().GetID(),
-			RequestedScopes: requester.GetRequestedScopes(),
-			GrantedScopes:   requester.GetGrantedScopes(),
-			GrantedAudience: requester.GetGrantedAudience(),
-			GrantTypes:      requester.GetGrantTypes(),
-			Payload:         requester.Sanitize([]string{"assertion"}).GetRequestForm(),
+			ClientID:            requester.GetClient().GetID(),
+			ClientJWKThumbprint: fosite.ClientJWKThumbprint(ctx),
+			RequestedScopes:     requester.GetRequestedScopes(),
+			GrantedScopes:       requester.GetGrantedScopes(),
+			GrantedAudience:     requester.GetGrantedAudience(),
+			GrantTypes:          requester.GetGrantTypes(),
+			Payload:             requester.Sanitize([]string{"assertion"}).GetRequestForm(),
 		}
 
 		reqBody := TokenHookRequest{

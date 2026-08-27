@@ -5,14 +5,19 @@ package oauth2_test
 
 import (
 	"context"
+	"crypto"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,8 +29,11 @@ import (
 	"github.com/ory/hydra/v2/driver"
 	"github.com/ory/hydra/v2/driver/config"
 	"github.com/ory/hydra/v2/flow"
+	"github.com/ory/hydra/v2/fosite/internal/gen"
+	"github.com/ory/hydra/v2/fosite/token/jwt"
 	"github.com/ory/hydra/v2/internal/testhelpers"
 	hydraoauth2 "github.com/ory/hydra/v2/oauth2"
+	"github.com/ory/hydra/v2/x"
 	"github.com/ory/x/configx"
 )
 
@@ -258,6 +266,7 @@ func TestClientCredentials(t *testing.T) {
 					require.NotEmpty(t, hookReq.Session)
 					require.Equal(t, hookReq.Session.Extra, map[string]interface{}{})
 					require.NotEmpty(t, hookReq.Request)
+					assert.Empty(t, hookReq.Request.ClientJWKThumbprint)
 					require.ElementsMatch(t, hookReq.Request.GrantedScopes, expectedGrantedScopes)
 					require.ElementsMatch(t, hookReq.Request.GrantedAudience, expectedGrantedAudience)
 					require.Equal(t, hookReq.Request.Payload, map[string][]string{
@@ -383,4 +392,63 @@ func TestClientCredentials(t *testing.T) {
 		t.Run("strategy=opaque", run("opaque"))
 		t.Run("strategy=jwt", run("jwt"))
 	})
+}
+
+func TestClientCredentialsPrivateKeyJWTTokenHook(t *testing.T) {
+	ctx := t.Context()
+	reg := testhelpers.NewRegistryMemory(t)
+	public, _ := testhelpers.NewOAuth2Server(ctx, t, reg)
+
+	key := gen.MustRSAKey()
+	jwk := jose.JSONWebKey{KeyID: "client-key", Use: "sig", Key: &key.PublicKey}
+	thumbprint, err := jwk.Thumbprint(crypto.SHA256)
+	require.NoError(t, err)
+	expectedThumbprint := base64.RawURLEncoding.EncodeToString(thumbprint)
+
+	client := &hc.Client{
+		ID:                      "private-key-client",
+		GrantTypes:              []string{"client_credentials"},
+		Scope:                   "foobar",
+		TokenEndpointAuthMethod: "private_key_jwt",
+		JSONWebKeys: &x.JoseJSONWebKeySet{JSONWebKeySet: &jose.JSONWebKeySet{
+			Keys: []jose.JSONWebKey{jwk},
+		}},
+	}
+	require.NoError(t, reg.ClientManager().CreateClient(ctx, client))
+
+	var hookCalled atomic.Bool
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hookCalled.Store(true)
+		var hookRequest hydraoauth2.TokenHookRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&hookRequest))
+		assert.Equal(t, expectedThumbprint, hookRequest.Request.ClientJWKThumbprint)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer hook.Close()
+	reg.Config().MustSet(ctx, config.KeyTokenHook, &config.HookConfig{URL: hook.URL})
+
+	assertion := jwt.NewWithClaims(jose.RS256, jwt.MapClaims{
+		"sub": client.ID,
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iss": client.ID,
+		"jti": uuid.Must(uuid.NewV4()).String(),
+		"aud": reg.Config().OAuth2TokenURL(ctx).String(),
+	})
+	assertion.Header["kid"] = jwk.KeyID
+	signedAssertion, err := assertion.SignedString(key)
+	require.NoError(t, err)
+
+	response, err := public.Client().PostForm(reg.Config().OAuth2TokenURL(ctx).String(), url.Values{
+		"grant_type":            {"client_credentials"},
+		"scope":                 {"foobar"},
+		"client_id":             {client.ID},
+		"client_assertion_type": {"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"},
+		"client_assertion":      {signedAssertion},
+	})
+	require.NoError(t, err)
+	defer response.Body.Close() //nolint:errcheck
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode, "%s", body)
+	assert.True(t, hookCalled.Load())
 }

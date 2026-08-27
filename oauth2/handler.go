@@ -1162,7 +1162,7 @@ type _ struct {
 //	Extensions:
 //	  x-ory-ratelimit-bucket: hydra-public-medium
 func (h *Handler) oauth2TokenExchange(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := fosite.WithClientJWKThumbprint(r.Context())
 	session := NewSessionWithCustomClaims(ctx, h.c, "")
 
 	accessRequest, err := h.r.OAuth2Provider().NewAccessRequest(ctx, r, session)
